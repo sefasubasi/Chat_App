@@ -29,13 +29,23 @@ void sendClientList(int client_socket) {
     send(client_socket, list.c_str(), list.size(), 0);
 }
 
-void handleChatSession(int senderSocket, int receiverSocket) {
-    char buffer[1024];
-    while (true) {
-        int valread = read(senderSocket, buffer, sizeof(buffer));
-        if (valread <= 0) break;
-        send(receiverSocket, buffer, valread, 0);
+//File transfer function
+void forwardFile(int senderSocket, int receiverSocket, const string& filename, size_t filesize) {
+    //Send file information to the recipient first
+    string header = "/file " + filename + " " + to_string(filesize);
+    send(receiverSocket, header.c_str(), header.size(), 0);
+
+    char buffer[4096];
+    size_t totalRead = 0;
+
+    while (totalRead < filesize) {
+        ssize_t bytesRead = read(senderSocket, buffer, min(sizeof(buffer), filesize - totalRead));
+        if (bytesRead <= 0) break;
+        send(receiverSocket, buffer, bytesRead, 0);
+        totalRead += bytesRead;
     }
+
+    cout << "File transfer complete: " << filename << " (" << filesize << " bytes)" << endl;
 }
 
 void handleClient(int client_socket) {
@@ -43,7 +53,7 @@ void handleClient(int client_socket) {
     string name;
 
     // -------------------------
-    // İsim kontrol döngüsü
+    // Name check loop
     // -------------------------
     while (true) {
         memset(buffer, 0, sizeof(buffer));
@@ -70,24 +80,24 @@ void handleClient(int client_socket) {
         }
 
         if (nameExists) {
-            string msg = "Bu isim kullaniliyor, tekrar deneyin: ";
+            string msg = "This name is already in use, please try again: ";
             send(client_socket, msg.c_str(), msg.size(), 0);
         } else {
             lock_guard<mutex> lock(clientsMtx);
             allClients[client_socket] = {client_socket, name, ""};
-            string welcomeMsg = "Hoş geldin, " + name + "! Sohbet için '/chat <isim>' veya '/list' kullanabilirsiniz.";
+            string welcomeMsg = "Welcome, " + name + "! Use '/chat <name>' or '/list' to chat. Use '/file <filename>' to send a file.";
             send(client_socket, welcomeMsg.c_str(), welcomeMsg.size(), 0);
             break;
         }
     }
 
-    cout << "Yeni istemci bağlandi: " << name << endl;
+    cout << "New client connected: " << name << endl;
 
     while (true) {
         memset(buffer, 0, sizeof(buffer));
         int valread = read(client_socket, buffer, sizeof(buffer));
         if (valread <= 0) {
-            cout << "İstemci " << name << " bağlantisi kapandi." << endl;
+            cout << "Client " << name << " connection closed." << endl;
             {
                 lock_guard<mutex> lock(clientsMtx);
                 allClients.erase(client_socket);
@@ -97,6 +107,7 @@ void handleClient(int client_socket) {
         }
 
         string message(buffer, valread);
+
         if (message.rfind("/list", 0) == 0) {
             sendClientList(client_socket);
         } 
@@ -113,9 +124,8 @@ void handleClient(int client_socket) {
                 }
             }
 
-            // Kendisiyle sohbet etmeye çalişiyorsa
             if (targetName == name) {
-                string errorMsg = "Kendinle sohbet edemezsin.";
+                string errorMsg = "You cannot chat with yourself.";
                 send(client_socket, errorMsg.c_str(), errorMsg.size(), 0);
                 continue;
             }
@@ -125,20 +135,52 @@ void handleClient(int client_socket) {
                 allClients[client_socket].currentChatPartner = targetName;
                 allClients[targetSocket].currentChatPartner = name;
 
-                string startMsg = "Eşleşme bulundu! " + targetName + " ile sohbet ediyorsunuz.";
+                string startMsg = "Match found! You are now chatting with " + targetName + ".";
                 send(client_socket, startMsg.c_str(), startMsg.size(), 0);
-                startMsg = "Eşleşme bulundu! " + name + " ile sohbet ediyorsunuz.";
+                startMsg = "Match found! You are now chatting with " + name + ".";
                 send(targetSocket, startMsg.c_str(), startMsg.size(), 0);
-
-                thread t1(handleChatSession, client_socket, targetSocket);
-                thread t2(handleChatSession, targetSocket, client_socket);
-                t1.join();
-                t2.join();
             } else {
-                string errorMsg = "Kullanici bulunamadi veya meşgul.";
+                string errorMsg = "User not found or busy.";
                 send(client_socket, errorMsg.c_str(), errorMsg.size(), 0);
             }
-        } else {
+        }
+        else if (message.rfind("/file ", 0) == 0) {
+            //Expected format: "/file filename size"
+            string rest = message.substr(6);
+            size_t spacePos = rest.find(' ');
+            if (spacePos == string::npos) {
+                string errorMsg = "Invalid file command.";
+                send(client_socket, errorMsg.c_str(), errorMsg.size(), 0);
+                continue;
+            }
+
+            string filename = rest.substr(0, spacePos);
+            size_t filesize = stoul(rest.substr(spacePos + 1));
+
+            lock_guard<mutex> lock(clientsMtx);
+            string partnerName = allClients[client_socket].currentChatPartner;
+            if (partnerName.empty()) {
+                string errorMsg = "You are not in a chat session.";
+                send(client_socket, errorMsg.c_str(), errorMsg.size(), 0);
+                continue;
+            }
+
+            int partnerSocket = -1;
+            for (const auto& pair : allClients) {
+                if (pair.second.name == partnerName) {
+                    partnerSocket = pair.first;
+                    break;
+                }
+            }
+
+            if (partnerSocket != -1) {
+                forwardFile(client_socket, partnerSocket, filename, filesize);
+            } else {
+                string errorMsg = "Partner not found.";
+                send(client_socket, errorMsg.c_str(), errorMsg.size(), 0);
+            }
+        }
+        else {
             lock_guard<mutex> lock(clientsMtx);
             string partnerName = allClients[client_socket].currentChatPartner;
             if (!partnerName.empty()) {
@@ -161,7 +203,7 @@ void handleClient(int client_socket) {
 int main() {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd == 0) {
-        perror("Soket oluşturma hatasi");
+        perror("Socket creation error");
         return 1;
     }
 
@@ -174,22 +216,22 @@ int main() {
     address.sin_port = htons(8080);
 
     if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
-        perror("Soket bağlama hatasi");
+        perror("Socket binding error");
         return 1;
     }
 
     if (listen(server_fd, 10) < 0) {
-        perror("Dinleme hatasi");
+        perror("Listen error");
         return 1;
     }
 
-    cout << "Sunucu dinlemede... (port 8080)" << endl;
+    cout << "Server is listening on port 8080..." << endl;
 
     while (true) {
         socklen_t addrlen = sizeof(address);
         int client_socket = accept(server_fd, (struct sockaddr *)&address, &addrlen);
         if (client_socket < 0) {
-            perror("Bağlanti kabul etme hatasi");
+            perror("Accept error");
             continue;
         }
         thread(handleClient, client_socket).detach();
